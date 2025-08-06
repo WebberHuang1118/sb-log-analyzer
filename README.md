@@ -1,18 +1,19 @@
-# log-analyze-and-sort.sh
+# sb-log-analyzer.sh
 
-A Bash script to search for log lines matching a string in files under a directory, sort them by timestamp, and write the results to an output file. It can also filter lines from an existing file by removing lines containing specified strings.
+A Bash script to search for log lines matching a string in files under a support bundle directory, sort them by timestamp, and write the results to an output file. It can also filter lines from an existing file by removing lines containing specified strings.
 
 ## Usage
 
 ```
-./log-analyze-and-sort.sh <search_dir> <search_string> <file_patterns> <exclude_string> <output_file>
+./sb-log-analyzer.sh [--sb-path <sb_path>] [--annotate-pods] <search_string> <file_patterns> <exclude_string> <output_file>
     (search & sort mode)
 
-./log-analyze-and-sort.sh --filter-only <input_file> <remove_list> <output_file>
+./sb-log-analyzer.sh --filter-only <input_file> <remove_list> <output_file>
     (filter-only mode)
 ```
 
-- `search_dir`: Directory under which to search for log files.
+- `--sb-path <sb_path>`: Path to the support bundle directory (required for search mode).
+- `--annotate-pods`: Enable pod owner and node annotation for logs from `/logs/longhorn-system/<pod>/`.
 - `search_string`: Literal string to match inside files.
 - `file_patterns`: Comma-separated filename globs (e.g. `'*foo*,*bar*'`). Use `'*'` to match all files.
 - `exclude_string`: Literal string; any matched line containing this will be excluded. Use `''` to disable.
@@ -27,11 +28,11 @@ A Bash script to search for log lines matching a string in files under a directo
 
 ## Features
 - **Search & sort mode:**
-  - Searches for files matching the given patterns under the specified directory.
+  - Searches for files matching the given patterns under `logs/` in the support bundle directory.
   - Finds lines containing the search string.
   - Excludes lines containing the exclude string (if provided).
   - Sorts the results by timestamp (ISO8601 format required in log lines).
-  - For log files under `/logs/longhorn-system/<pod>/`, prepends `[owner node]:` to each line using pod info from Kubernetes (requires `kubectl` access to a real cluster or an `sb` simulator).
+  - When `--annotate-pods` is used, for log files under `/logs/longhorn-system/<pod>/`, prepends `[owner node]:` to each line using pod info from support bundle or from Kubernetes (requires either pod information in the support bundle or `kubectl` access to a cluster).
   - Collapses multiple blank lines into a single blank line.
 - **Filter-only mode:**
   - Removes lines containing any string in `remove_list`.
@@ -42,18 +43,18 @@ A Bash script to search for log lines matching a string in files under a directo
 
 **Search & sort mode:**
 ```
-./log-analyze-and-sort.sh /path/to/logs my-search-term '*longhorn-csi-plugin*,*longhorn-manager*' 'Request (user: system:serviceaccount:longhorn-system:longhorn-service-account' ./sorted.log
+./sb-log-analyzer.sh --sb-path /path/to/support-bundle --annotate-pods my-search-term '*longhorn-csi-plugin*,*longhorn-manager*' 'Request (user: system:serviceaccount:longhorn-system:longhorn-service-account' ./sorted.log
 ```
 This will:
-- Search for files matching `*longhorn-csi-plugin*` or `*longhorn-manager*` under `/path/to/logs`.
+- Search for files matching `*longhorn-csi-plugin*` or `*longhorn-manager*` under `/path/to/support-bundle/logs/`.
 - Find lines containing `my-search-term`.
 - Exclude lines containing the specified `exclude_string`.
 - Sort the results by timestamp and write to `./sorted.log`.
-- For log files under `/logs/longhorn-system/<pod>/`, prepend `[owner node]:` to each line using pod info from Kubernetes.
+- For log files under `/logs/longhorn-system/<pod>/`, prepend `[owner node]:` to each line using pod info.
 
 **Filter-only mode:**
 ```
-./log-analyze-and-sort.sh --filter-only ./sorted.log 'foo,bar,baz' ./filtered.log
+./sb-log-analyzer.sh --filter-only ./sorted.log 'foo,bar,baz' ./filtered.log
 ```
 This will:
 - Remove lines containing `foo`, `bar`, or `baz` from `./sorted.log`.
