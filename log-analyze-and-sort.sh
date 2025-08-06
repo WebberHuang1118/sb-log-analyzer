@@ -130,81 +130,170 @@ delim=$'\x1f'
 # ---------- build pod->(owner,node) map ----------
 pod_map_enabled="$annotate_pods"
 declare -A pod_map=()  # Initialize empty associative array explicitly
-if [[ "$pod_map_enabled" == "1" ]]; then
-  # First try to get pod information from the support bundle
-  pod_list_file=""
-  possible_locations=(
-    "$sb_path/objects/longhorn-system/pods.json"
-    "$sb_path/objects/longhorn-system/pods.yaml"
-    "$sb_path/objects/api/v1/namespaces/longhorn-system/pods.json"
+declare -A pod_cache=()  # Cache for pod lookups (including not found)
+
+# Function to extract pod info from YAML manifest
+extract_pod_from_yaml() {
+  local pod_name="$1"
+  local namespace="$2"
+  local yaml_file="$3"
+
+  # Create cache key with namespace to avoid conflicts
+  local cache_key="${namespace}/${pod_name}"
+
+  # Check cache first
+  if [[ -n "${pod_cache[$cache_key]+x}" ]]; then
+    if [[ "${pod_cache[$cache_key]}" != "NOT_FOUND" ]]; then
+      echo "${pod_cache[$cache_key]}"
+    fi
+    return
+  fi
+
+  if [[ ! -f "$yaml_file" ]]; then
+    pod_cache["$cache_key"]="NOT_FOUND"
+    return
+  fi
+
+  # Parse YAML to find the specific pod and extract owner/node info
+  # This searches for the pod by name and extracts owner reference and nodeName
+  local result
+  result=$(awk -v target_pod="$pod_name" '
+    BEGIN {
+      found_target = 0
+      owner = "unknown"
+      node = "unknown"
+      in_owner_ref = 0
+      output_done = 0
+    }
+
+    # Found the target pod name
+    /^    name: / && $2 == target_pod {
+      found_target = 1
+      next
+    }
+
+    # Extract owner reference name when we find controller: true
+    found_target && /^    - apiVersion:/ {
+      in_owner_ref = 1
+      next
+    }
+
+    found_target && in_owner_ref && /^      controller: true/ {
+      # The next few lines should contain the owner name
+      while ((getline line) > 0) {
+        if (line ~ /^      name: /) {
+          split(line, parts, ": ")
+          owner = parts[2]
+          break
+        }
+        if (line ~ /^    [^ ]/ || line ~ /^  [^ ]/) {
+          # End of this owner reference block
+          break
+        }
+      }
+      in_owner_ref = 0
+      next
+    }
+
+    # Extract node name
+    found_target && /^    nodeName: / {
+      node = $2
+    }
+
+    # End of current pod (start of next item) - output and exit
+    found_target && /^- apiVersion: v1/ {
+      if (!output_done) {
+        print owner " " node
+        output_done = 1
+      }
+      exit
+    }
+
+    # Alternative end condition - new pod item
+    found_target && /^    name: / && $2 != target_pod {
+      if (!output_done) {
+        print owner " " node
+        output_done = 1
+      }
+      exit
+    }
+
+    END {
+      if (found_target && !output_done) {
+        print owner " " node
+      }
+    }
+  ' "$yaml_file")
+
+  if [[ -n "$result" ]]; then
+    # Clean up any newlines or extra whitespace from the result
+    result=$(echo "$result" | tr -d '\n' | sed 's/[[:space:]]\+/ /g' | sed 's/^ *//;s/ *$//')
+    pod_cache["$cache_key"]="$result"
+    echo "$result"
+  else
+    pod_cache["$cache_key"]="NOT_FOUND"
+  fi
+}
+
+# Function to find pod manifest file for a given namespace
+find_pod_manifest() {
+  local namespace="$1"
+
+  # Try different possible locations for pod manifests
+  local possible_locations=(
+    "$sb_path/yamls/namespaced/$namespace/v1/pods.yaml"
+    "$sb_path/yamls/$namespace/pods.yaml"
+    "$sb_path/manifests/$namespace/pods.yaml"
+    "$sb_path/objects/$namespace/pods.yaml"
   )
 
   for location in "${possible_locations[@]}"; do
     if [[ -f "$location" ]]; then
-      pod_list_file="$location"
-      break
+      echo "$location"
+      return 0
     fi
   done
 
-  if [[ -n "$pod_list_file" ]]; then
-    echo "Loading pod information from $pod_list_file"
-    if [[ "$pod_list_file" == *.json ]]; then
-      # Extract pod info from JSON (requires jq)
-      if command -v jq >/dev/null 2>&1; then
-        while read -r pod owner node; do
-          [[ -n "$pod" && -n "$owner" && -n "$node" ]] || continue
-          pod_map["$pod"]="$owner $node"
-        done < <(
-          jq -r '.items[] | select(.metadata.name != null) |
-            [.metadata.name,
-             (.metadata.ownerReferences[] | select(.controller==true) | .name) // "unknown",
-             .spec.nodeName // "unknown"] | 
-            @tsv' "$pod_list_file"
-        )
-      else
-        echo "Warning: jq not found. Cannot parse JSON pod information." >&2
-      fi
-    elif [[ "$pod_list_file" == *.yaml ]]; then
-      echo "Warning: YAML parsing not implemented yet. Using kubectl fallback." >&2
-    fi
-  fi
+  return 1
+}
 
-  # Fallback to kubectl if no pods were loaded from files
-  if [[ ${#pod_map[@]} -eq 0 ]]; then
-    echo "Trying to get pod information from kubectl..."
-    while read -r pod owner node; do
-      [[ -n "$pod" && -n "$owner" && -n "$node" ]] || continue
-      pod_map["$pod"]="$owner $node"
-    done < <(
-      kubectl get pods -n longhorn-system \
-        -o=jsonpath='{range .items[*]}{.metadata.name} {.metadata.ownerReferences[?(@.controller==true)].name} {.spec.nodeName}{"\n"}{end}' 2>/dev/null || echo ""
-    )
-  fi
-
-  # Report pod map status
-  if [[ ${#pod_map[@]} -gt 0 ]]; then
-    echo "Successfully loaded information for ${#pod_map[@]} pods"
-  else
-    echo "Warning: Could not load pod information. Pod annotations will not be applied." >&2
-    pod_map_enabled=0
-  fi
+if [[ "$pod_map_enabled" == "1" ]]; then
+  echo "Pod annotation mode enabled - will discover namespaces dynamically"
+  # We'll discover manifest files on-demand per namespace
 fi
 
 # ---------- transform function ----------
 transform() {
   while IFS= read -r line; do
-    # Match both ./logs/longhorn-system/pod/file.log and logs/longhorn-system/pod/file.log formats
-    if [[ "$line" =~ ^.*[/.]logs/longhorn-system/([^/]+)/[^:]+ ]]; then
-      pod="${BASH_REMATCH[1]}"
+    # Match log paths with namespace/pod/file.log format
+    # Supports both ./logs/namespace/pod/file.log and logs/namespace/pod/file.log formats
+    if [[ "$line" =~ ^.*[/.]logs/([^/]+)/([^/]+)/[^:]+ ]]; then
+      namespace="${BASH_REMATCH[1]}"
+      pod="${BASH_REMATCH[2]}"
       # Remove .log or .log.N suffix if present
       pod=${pod%%.*}
 
-      if [[ "$pod_map_enabled" == "1" && -n "${pod_map[$pod]+x}" ]]; then
-        info="${pod_map[$pod]}"
-        owner="${info%% *}"
-        node="${info#* }"
-        # Format with owner and node prepended
-        echo "[${owner} ${node}]:${line#*:}"
+      if [[ "$pod_map_enabled" == "1" ]]; then
+        # Find the pod manifest file for this namespace
+        yaml_pods_file=$(find_pod_manifest "$namespace")
+
+        if [[ -n "$yaml_pods_file" ]]; then
+          # Extract pod info on-demand with caching
+          info=$(extract_pod_from_yaml "$pod" "$namespace" "$yaml_pods_file")
+
+          if [[ -n "$info" ]]; then
+            owner="${info%% *}"
+            node="${info#* }"
+            # Format with namespace, owner and node prepended
+            echo "[${namespace}/${owner} ${node}]:${line#*:}"
+          else
+            # Pod not found in manifest, output with namespace only
+            echo "[${namespace}]:${line#*:}"
+          fi
+        else
+          # No manifest found for namespace, output with namespace only
+          echo "[${namespace}]:${line#*:}"
+        fi
       else
         echo "$line"
       fi
